@@ -147,7 +147,7 @@ void rt1_close()
 
 int rt1_send(const void *buf, size_t size)
 {
-	static uint16_t msg_id = 0;
+	static uint8_t msg_id = 0;
 	int ret = thread_safe_data_packet_queue_send_buf(&send_queue, buf, size, msg_id);
 	msg_id++;
 	return ret;
