@@ -182,7 +182,7 @@ int thread_safe_data_packet_queue_recv_buf(struct thread_safe_data_packet_queue*
         }
 
         // Cập nhật offset kỳ vọng: luôn cộng 15 (60/4) vì các mảnh giữa luôn phải full
-        expected_offset_units += (DATA_MAX_LENGTH / 4);
+        expected_offset_units += (pkt.data_length / 4);
 
         // --- Kết thúc bản tin ---
         if (mf == 0) {
