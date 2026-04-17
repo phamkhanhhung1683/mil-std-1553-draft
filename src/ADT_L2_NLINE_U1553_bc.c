@@ -222,6 +222,14 @@ static void *interrupt_poll(void *arg)
 
 static void ADT_L0_CALL_CONV myIntHandler(void *pUserData)
 {
+	static bool is_waiting_ack = false;
+	static uint8_t current_seq_num = 0;
+	static struct data_packet current_bc_pkt = {0};
+
+	static bool should_send_bc_ack = false;
+	static uint8_t expected_rt_seq_num = 0;
+	static uint8_t bc_ack = 0;
+
 	ADT_L0_UINT32 intType[MAX_IQ_ENTRIES], intInfo[MAX_IQ_ENTRIES];
 	ADT_L0_UINT32 numInts = 0;
 	ADT_L0_UINT32 status = ADT_L1_1553_INT_IQ_ReadNewEntries(DEVID, MAX_IQ_ENTRIES, &numInts, intType, intInfo);
@@ -231,31 +239,82 @@ static void ADT_L0_CALL_CONV myIntHandler(void *pUserData)
 			{
 				ADT_L0_UINT32 bccbNum = intInfo[i];
 				ADT_L1_1553_CDP myIntCdp = {0};
-				struct data_packet pkt = {0};
 
-				if (bccbNum == 1) {
-					int s = thread_safe_data_packet_queue_try_pop(&send_queue, &pkt);
-					if (s == -1)
-						data_packet_set_nf(&pkt, 1);
-
-					uint16_t *data_word = (uint16_t *)&pkt;
-					for (int j = 0; j < 32; j++) {
-						myIntCdp.DATAinfo[j] = data_word[j];
+				if (bccbNum == 1) {  // BC sends data to RT
+					if (!is_waiting_ack) {
+						int s = thread_safe_data_packet_queue_try_pop(&send_queue, &current_bc_pkt);
+						if (s == -1) {
+							struct data_packet data_pkt = {0};
+							data_packet_set_nf(&data_pkt, 1);
+							uint16_t *data_word = (uint16_t *)&data_pkt;
+							for (int j = 0; j < 32; j++) {
+								myIntCdp.DATAinfo[j] = data_word[j];
+							}
+							ADT_L1_1553_BC_CB_CDPWrite(DEVID, 1, 0, &myIntCdp);
+						} else {
+							current_seq_num = 1 - current_seq_num;
+							data_packet_set_seq_num(&current_bc_pkt, current_seq_num);
+							uint16_t *data_word = (uint16_t *)&current_bc_pkt;
+							for (int j = 0; j < 32; j++) {
+								myIntCdp.DATAinfo[j] = data_word[j];
+							}
+							ADT_L1_1553_BC_CB_CDPWrite(DEVID, 1, 0, &myIntCdp);
+							is_waiting_ack = true;
+						}
+					} else {
+						uint16_t *data_word = (uint16_t *)&current_bc_pkt;
+						for (int j = 0; j < 32; j++) {
+							myIntCdp.DATAinfo[j] = data_word[j];
+						}
+						ADT_L1_1553_BC_CB_CDPWrite(DEVID, 1, 0, &myIntCdp);
 					}
-
-					ADT_L1_1553_BC_CB_CDPWrite(DEVID, 1, 0, &myIntCdp);
-				} else if (bccbNum == 2) {
+				} else if (bccbNum == 2) {  // RT sends ACK to BC
 					status = ADT_L1_1553_BC_CB_CDPRead(DEVID, 2, 0, &myIntCdp);
-					if ((status == ADT_SUCCESS)) {
-						uint16_t *data_word = (uint16_t *)&pkt;
+					if (status == ADT_SUCCESS) {
+						uint16_t rt_ack_pkt = myIntCdp.DATAinfo[0];
+						uint8_t ack_flag = ack_packet_get_ack_flag(rt_ack_pkt);
+						if (ack_flag) {
+							uint8_t ack_num = ack_packet_get_ack_num(rt_ack_pkt);
+							if (ack_num != current_seq_num) {
+								is_waiting_ack = false;
+							}
+						}
+					}
+				} else if (bccbNum == 3) {  // RT sends data to BC
+					should_send_bc_ack = false;
+
+					status = ADT_L1_1553_BC_CB_CDPRead(DEVID, 3, 0, &myIntCdp);
+					if (status == ADT_SUCCESS) {
+						struct data_packet data_pkt;
+						uint16_t *data_word = (uint16_t *)&data_pkt;
 						for (int j = 0; j < 32; j++) {
 							data_word[j] = myIntCdp.DATAinfo[j];
 						}
 
-						uint8_t nf = data_packet_get_nf(&pkt);
-						if (nf == 0)
-							thread_safe_data_packet_queue_try_push(&recv_queue, &pkt);
+						uint8_t nf = data_packet_get_nf(&data_pkt);
+						if (nf == 0) {
+							uint8_t rt_seq_num = data_packet_get_seq_num(&data_pkt);
+							if (rt_seq_num == expected_rt_seq_num) {  // TODO(hungpk3): check expected_rt_seq_num comparison
+								thread_safe_data_packet_queue_try_push(&recv_queue, &data_pkt);
+								expected_rt_seq_num = 1 - expected_rt_seq_num;
+								bc_ack = expected_rt_seq_num;
+								should_send_ack = true;
+							} else {
+								bc_ack = expected_rt_seq_num;
+								should_send_ack = true;
+							}
+						}
 					}
+				} else if (bccbNum == 4) {  // BC sends ACK to RT
+					uint16_t ack_pkt = 0;
+
+					if (should_send_bc_ack) {
+						ack_pkt_set_ack_flag(&ack_pkt, 1);
+						ack_pkt_set_ack_num(&ack_pkt, bc_ack);
+					}
+
+					myIntCdp.DATAinfo[0] = ack_pkt;
+					ADT_L1_1553_BC_CB_CDPWrite(DEVID, 4, 0, &myIntCdp);
 				}
 			}
 		} 
