@@ -12,6 +12,14 @@
 #define DEVID (ADT_PRODUCT_NLINE_U1553 | ADT_DEVID_BOARDNUM_01 | ADT_DEVID_CHANNELTYPE_1553 | ADT_DEVID_CHANNELNUM_01)
 #define MAX_IQ_ENTRIES 100
 
+enum bc_state {
+	BC_STATE_CLOSED = 0,
+	BC_STATE_SYN_SENT = 1,
+	BC_STATE_ESTABLISHED = 2
+};
+
+static atomic_int connection_state = BC_STATE_CLOSED;
+
 static struct thread_safe_data_packet_queue send_queue;
 static struct thread_safe_data_packet_queue recv_queue;
 
@@ -19,7 +27,7 @@ static atomic_bool running = false;
 static pthread_t polling_thread_id;
 
 static void *interrupt_poll(void *arg);
-static void ADT_L0_CALL_CONV myIntHandler(void *pUserData);
+static void myIntHandler(void *pUserData);
 
 int bc_init()
 {
@@ -220,15 +228,12 @@ static void *interrupt_poll(void *arg)
 	return NULL;
 }
 
-static void ADT_L0_CALL_CONV myIntHandler(void *pUserData)
+static void myIntHandler(void *pUserData)
 {
-	static bool is_waiting_ack = false;
 	static uint8_t current_seq_num = 0;
 	static struct data_packet current_bc_pkt = {0};
-
-	static bool should_send_bc_ack = false;
-	static uint8_t expected_rt_seq_num = 0;
-	static uint8_t bc_ack = 0;
+	static uint8_t last_rt_ack_num = 0;
+	static uint8_t last_rt_seq_num = 0;
 
 	ADT_L0_UINT32 intType[MAX_IQ_ENTRIES], intInfo[MAX_IQ_ENTRIES];
 	ADT_L0_UINT32 numInts = 0;
@@ -240,81 +245,67 @@ static void ADT_L0_CALL_CONV myIntHandler(void *pUserData)
 				ADT_L0_UINT32 bccbNum = intInfo[i];
 				ADT_L1_1553_CDP myIntCdp = {0};
 
-				if (bccbNum == 1) {  // BC sends data to RT
-					if (!is_waiting_ack) {
-						int s = thread_safe_data_packet_queue_try_pop(&send_queue, &current_bc_pkt);
-						if (s == -1) {
-							struct data_packet data_pkt = {0};
-							data_packet_set_nf(&data_pkt, 1);
-							uint16_t *data_word = (uint16_t *)&data_pkt;
-							for (int j = 0; j < 32; j++) {
-								myIntCdp.DATAinfo[j] = data_word[j];
+				if (bccbNum == 1) {  // BC sent data packet to RT
+					if (atomic_load(&connection_state) == BC_STATE_SYN_SENT) {
+						memset(&current_bc_pkt, 0, sizeof(current_bc_pkt));
+						data_packet_set_syn_flag(&current_bc_pkt, 1);
+						data_packet_set_seq_num(&current_bc_pkt, 0);
+					} else if (atomic_load(&connection_state) == BC_STATE_ESTABLISHED) {
+						if (last_rt_ack_num == (1 - current_seq_num)) {
+							int s = thread_safe_data_packet_queue_try_pop(&send_queue, &current_bc_pkt);
+							if (s == -1) {
+								memset(&current_bc_pkt, 0, sizeof(current_bc_pkt));
+								data_packet_set_null_fragment_flag(&current_bc_pkt, 1);
+							} else {
+								current_seq_num = 1 - current_seq_num;
+								data_packet_set_seq_num(&current_bc_pkt, current_seq_num);
+								data_packet_set_syn_flag(&current_bc_pkt, 0);
+								data_packet_set_null_fragment_flag(&current_bc_pkt, 0);
 							}
-							ADT_L1_1553_BC_CB_CDPWrite(DEVID, 1, 0, &myIntCdp);
-						} else {
-							current_seq_num = 1 - current_seq_num;
-							data_packet_set_seq_num(&current_bc_pkt, current_seq_num);
-							uint16_t *data_word = (uint16_t *)&current_bc_pkt;
-							for (int j = 0; j < 32; j++) {
-								myIntCdp.DATAinfo[j] = data_word[j];
-							}
-							ADT_L1_1553_BC_CB_CDPWrite(DEVID, 1, 0, &myIntCdp);
-							is_waiting_ack = true;
 						}
-					} else {
-						uint16_t *data_word = (uint16_t *)&current_bc_pkt;
-						for (int j = 0; j < 32; j++) {
-							myIntCdp.DATAinfo[j] = data_word[j];
-						}
-						ADT_L1_1553_BC_CB_CDPWrite(DEVID, 1, 0, &myIntCdp);
+
+						data_packet_set_ack_flag(&current_bc_pkt, 1);
+						data_packet_set_ack_num(&current_bc_pkt, 1 - last_rt_seq_num);
 					}
-				} else if (bccbNum == 2) {  // RT sends ACK to BC
+
+					uint16_t *data_word = (uint16_t *)&current_bc_pkt;
+					for (int j = 0; j < 32; j++) {
+						myIntCdp.DATAinfo[j] = data_word[j];
+					}
+					ADT_L1_1553_BC_CB_CDPWrite(DEVID, 1, 0, &myIntCdp);
+				} else if (bccbNum == 2) {  // BC received data packet from RT
 					status = ADT_L1_1553_BC_CB_CDPRead(DEVID, 2, 0, &myIntCdp);
 					if (status == ADT_SUCCESS) {
-						uint16_t rt_ack_pkt = myIntCdp.DATAinfo[0];
-						uint8_t ack_flag = ack_packet_get_ack_flag(rt_ack_pkt);
-						if (ack_flag) {
-							uint8_t ack_num = ack_packet_get_ack_num(rt_ack_pkt);
-							if (ack_num != current_seq_num) {
-								is_waiting_ack = false;
-							}
-						}
-					}
-				} else if (bccbNum == 3) {  // RT sends data to BC
-					should_send_bc_ack = false;
-
-					status = ADT_L1_1553_BC_CB_CDPRead(DEVID, 3, 0, &myIntCdp);
-					if (status == ADT_SUCCESS) {
-						struct data_packet data_pkt;
-						uint16_t *data_word = (uint16_t *)&data_pkt;
+						struct data_packet pkt;
+						uint16_t *data_word = (uint16_t *)&pkt;
 						for (int j = 0; j < 32; j++) {
 							data_word[j] = myIntCdp.DATAinfo[j];
 						}
 
-						uint8_t nf = data_packet_get_nf(&data_pkt);
-						if (nf == 0) {
-							uint8_t rt_seq_num = data_packet_get_seq_num(&data_pkt);
-							if (rt_seq_num == expected_rt_seq_num) {  // TODO(hungpk3): check expected_rt_seq_num comparison
-								thread_safe_data_packet_queue_try_push(&recv_queue, &data_pkt);
-								expected_rt_seq_num = 1 - expected_rt_seq_num;
-								bc_ack = expected_rt_seq_num;
-								should_send_ack = true;
-							} else {
-								bc_ack = expected_rt_seq_num;
-								should_send_ack = true;
+						uint8_t rt_syn_flag = data_packet_get_syn_flag(&pkt);
+                    	uint8_t rt_ack_flag = data_packet_get_ack_flag(&pkt);
+						uint8_t rt_seq_num = data_packet_get_seq_num(&pkt);
+						uint8_t rt_ack_num = data_packet_get_ack_num(&pkt);
+
+						if (atomic_load(&connection_state) == BC_STATE_SYN_SENT) {
+							if (rt_syn_flag && rt_ack_flag && (rt_ack_num == 1)) {
+								atomic_store(&connection_state, BC_STATE_ESTABLISHED);
+								last_rt_seq_num = rt_seq_num;
+							}
+						} else if (atomic_load(&connection_state) == BC_STATE_ESTABLISHED) {
+							if (rt_ack_flag) {
+								last_rt_ack_num = rt_ack_num;
+							}
+
+							uint8_t nf = data_packet_get_null_fragment_flag(&pkt);
+							if (nf == 0 && (rt_seq_num == 1 - last_rt_seq_num)) {
+								int s = thread_safe_data_packet_queue_try_push(&recv_queue, &pkt);
+								if (s == 0) {
+									last_rt_seq_num = rt_seq_num;
+								}
 							}
 						}
 					}
-				} else if (bccbNum == 4) {  // BC sends ACK to RT
-					uint16_t ack_pkt = 0;
-
-					if (should_send_bc_ack) {
-						ack_pkt_set_ack_flag(&ack_pkt, 1);
-						ack_pkt_set_ack_num(&ack_pkt, bc_ack);
-					}
-
-					myIntCdp.DATAinfo[0] = ack_pkt;
-					ADT_L1_1553_BC_CB_CDPWrite(DEVID, 4, 0, &myIntCdp);
 				}
 			}
 		} 
