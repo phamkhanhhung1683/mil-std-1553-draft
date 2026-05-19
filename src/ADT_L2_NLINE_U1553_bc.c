@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include <pthread.h>
 
@@ -18,7 +19,8 @@ enum bc_state {
 	BC_STATE_ESTABLISHED = 2
 };
 
-static atomic_int connection_state = BC_STATE_CLOSED;
+static enum bc_state connection_state = BC_STATE_CLOSED;
+static pthread_mutex_t connection_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static struct thread_safe_data_packet_queue send_queue;
 static struct thread_safe_data_packet_queue recv_queue;
@@ -27,7 +29,7 @@ static atomic_bool running = false;
 static pthread_t polling_thread_id;
 
 static void *interrupt_poll(void *arg);
-static void myIntHandler(void *pUserData);
+static void myIntHandler();
 
 int bc_init()
 {
@@ -206,8 +208,42 @@ void bc_close()
 		printf("FAILURE - Error = %d %s\n", status, ADT_L1_Error_to_String(status));
 }
 
+int bc_connect()
+{
+	pthread_mutex_lock(&connection_state_mutex);
+
+	if (connection_state == BC_STATE_ESTABLISHED) {
+		pthread_mutex_unlock(&connection_state_mutex);
+		return 0;
+	}
+
+	if (connection_state == BC_STATE_SYN_SENT) {
+		pthread_mutex_unlock(&connection_state_mutex);
+		return -1;
+	}
+
+	connection_state = BC_STATE_SYN_SENT;
+	while (connection_state != BC_STATE_SYN_SENT) {
+		
+	}
+
+	pthread_mutex_unlock(&connection_state_mutex);
+    return 0;
+
+}
+
 int bc_send(const void *buf, size_t size)
 {
+	if (buf == NULL || size == 0)
+        return -1;
+
+	pthread_mutex_lock(&connection_state_mutex);
+    if (connection_state != BC_STATE_ESTABLISHED) {
+        pthread_mutex_unlock(&connection_state_mutex);
+        return -1;
+    }
+    pthread_mutex_unlock(&connection_state_mutex);
+
 	static uint8_t msg_id = 0;
 	int ret = thread_safe_data_packet_queue_send_buf(&send_queue, buf, size, msg_id);
 	msg_id++;
@@ -216,19 +252,29 @@ int bc_send(const void *buf, size_t size)
 
 int bc_recv(void *buf, size_t size)
 {
+	if (buf == NULL || size == 0)
+        return -1;
+
+	pthread_mutex_lock(&connection_state_mutex);
+    if (connection_state != BC_STATE_ESTABLISHED) {
+        pthread_mutex_unlock(&connection_state_mutex);
+        return -1;
+    }
+    pthread_mutex_unlock(&connection_state_mutex);
+
 	return thread_safe_data_packet_queue_recv_buf(&recv_queue, buf, size);
 }
 
 static void *interrupt_poll(void *arg)
 {
 	while (atomic_load(&running)) {
-		myIntHandler(NULL);
+		myIntHandler();
 		ADT_L1_msSleep(1);
 	}
 	return NULL;
 }
 
-static void myIntHandler(void *pUserData)
+static void myIntHandler()
 {
 	static uint8_t current_seq_num = 0;
 	static struct data_packet current_bc_pkt = {0};
@@ -238,76 +284,82 @@ static void myIntHandler(void *pUserData)
 	ADT_L0_UINT32 intType[MAX_IQ_ENTRIES], intInfo[MAX_IQ_ENTRIES];
 	ADT_L0_UINT32 numInts = 0;
 	ADT_L0_UINT32 status = ADT_L1_1553_INT_IQ_ReadNewEntries(DEVID, MAX_IQ_ENTRIES, &numInts, intType, intInfo);
-	if ((status == ADT_SUCCESS) && numInts) {
-		for (int i = 0; i < numInts; i++) {
-			if ((intType[i] & 0xFFFF0000) == ADT_L1_1553_IQP_TYPESEQ_BCCB)
-			{
-				ADT_L0_UINT32 bccbNum = intInfo[i];
-				ADT_L1_1553_CDP myIntCdp = {0};
+	if ((status != ADT_SUCCESS) || (numInts == 0))
+		return;
 
-				if (bccbNum == 1) {  // BC sent data packet to RT
-					if (atomic_load(&connection_state) == BC_STATE_SYN_SENT) {
-						memset(&current_bc_pkt, 0, sizeof(current_bc_pkt));
-						data_packet_set_syn_flag(&current_bc_pkt, 1);
-						data_packet_set_seq_num(&current_bc_pkt, 0);
-					} else if (atomic_load(&connection_state) == BC_STATE_ESTABLISHED) {
-						if (last_rt_ack_num == (1 - current_seq_num)) {
-							int s = thread_safe_data_packet_queue_try_pop(&send_queue, &current_bc_pkt);
-							if (s == -1) {
-								memset(&current_bc_pkt, 0, sizeof(current_bc_pkt));
-								data_packet_set_null_fragment_flag(&current_bc_pkt, 1);
-							} else {
-								current_seq_num = 1 - current_seq_num;
-								data_packet_set_seq_num(&current_bc_pkt, current_seq_num);
-								data_packet_set_syn_flag(&current_bc_pkt, 0);
-								data_packet_set_null_fragment_flag(&current_bc_pkt, 0);
-							}
+	pthread_mutex_lock(&connection_state_mutex);
+
+	for (int i = 0; i < numInts; i++) {
+		if ((intType[i] & 0xFFFF0000) == ADT_L1_1553_IQP_TYPESEQ_BCCB) {
+			ADT_L0_UINT32 bccbNum = intInfo[i];
+			ADT_L1_1553_CDP myIntCdp = {0};
+
+			if (bccbNum == 1) {  // BC sent data packet to RT
+				if (connection_state == BC_STATE_SYN_SENT) {
+					memset(&current_bc_pkt, 0, sizeof(current_bc_pkt));
+					data_packet_set_syn_flag(&current_bc_pkt, 1);
+					data_packet_set_seq_num(&current_bc_pkt, 0);
+				} else if (connection_state == BC_STATE_ESTABLISHED) {
+					if (last_rt_ack_num == (1 - current_seq_num)) {
+						int s = thread_safe_data_packet_queue_try_pop(&send_queue, &current_bc_pkt);
+						if (s == -1) {
+							memset(&current_bc_pkt, 0, sizeof(current_bc_pkt));
+							data_packet_set_null_fragment_flag(&current_bc_pkt, 1);
+						} else {
+							current_seq_num = 1 - current_seq_num;
+							data_packet_set_seq_num(&current_bc_pkt, current_seq_num);
+							data_packet_set_syn_flag(&current_bc_pkt, 0);
+							data_packet_set_null_fragment_flag(&current_bc_pkt, 0);
 						}
-
-						data_packet_set_ack_flag(&current_bc_pkt, 1);
-						data_packet_set_ack_num(&current_bc_pkt, 1 - last_rt_seq_num);
 					}
 
-					uint16_t *data_word = (uint16_t *)&current_bc_pkt;
-					for (int j = 0; j < 32; j++) {
-						myIntCdp.DATAinfo[j] = data_word[j];
+					data_packet_set_ack_flag(&current_bc_pkt, 1);
+					data_packet_set_ack_num(&current_bc_pkt, 1 - last_rt_seq_num);
+				}
+
+				uint16_t *data_word = (uint16_t *)&current_bc_pkt;
+				for (int j = 0; j < 32; j++) {
+					myIntCdp.DATAinfo[j] = data_word[j];
+				}
+
+				ADT_L1_1553_BC_CB_CDPWrite(DEVID, 1, 0, &myIntCdp);
+			} else if (bccbNum == 2) {  // BC received data packet from RT
+				status = ADT_L1_1553_BC_CB_CDPRead(DEVID, 2, 0, &myIntCdp);
+				if (status != ADT_SUCCESS)
+					continue;
+
+				struct data_packet pkt;
+				uint16_t *data_word = (uint16_t *)&pkt;
+				for (int j = 0; j < 32; j++) {
+					data_word[j] = myIntCdp.DATAinfo[j];
+				}
+
+				uint8_t rt_syn_flag = data_packet_get_syn_flag(&pkt);
+				uint8_t rt_ack_flag = data_packet_get_ack_flag(&pkt);
+				uint8_t rt_seq_num = data_packet_get_seq_num(&pkt);
+				uint8_t rt_ack_num = data_packet_get_ack_num(&pkt);
+
+				if (connection_state == BC_STATE_SYN_SENT) {
+					if (rt_syn_flag && rt_ack_flag && (rt_ack_num == 1)) {
+						connection_state = BC_STATE_ESTABLISHED;
+						last_rt_seq_num = rt_seq_num;
 					}
-					ADT_L1_1553_BC_CB_CDPWrite(DEVID, 1, 0, &myIntCdp);
-				} else if (bccbNum == 2) {  // BC received data packet from RT
-					status = ADT_L1_1553_BC_CB_CDPRead(DEVID, 2, 0, &myIntCdp);
-					if (status == ADT_SUCCESS) {
-						struct data_packet pkt;
-						uint16_t *data_word = (uint16_t *)&pkt;
-						for (int j = 0; j < 32; j++) {
-							data_word[j] = myIntCdp.DATAinfo[j];
-						}
+				} else if (connection_state == BC_STATE_ESTABLISHED) {
+					if (rt_ack_flag) {
+						last_rt_ack_num = rt_ack_num;
+					}
 
-						uint8_t rt_syn_flag = data_packet_get_syn_flag(&pkt);
-                    	uint8_t rt_ack_flag = data_packet_get_ack_flag(&pkt);
-						uint8_t rt_seq_num = data_packet_get_seq_num(&pkt);
-						uint8_t rt_ack_num = data_packet_get_ack_num(&pkt);
-
-						if (atomic_load(&connection_state) == BC_STATE_SYN_SENT) {
-							if (rt_syn_flag && rt_ack_flag && (rt_ack_num == 1)) {
-								atomic_store(&connection_state, BC_STATE_ESTABLISHED);
-								last_rt_seq_num = rt_seq_num;
-							}
-						} else if (atomic_load(&connection_state) == BC_STATE_ESTABLISHED) {
-							if (rt_ack_flag) {
-								last_rt_ack_num = rt_ack_num;
-							}
-
-							uint8_t nf = data_packet_get_null_fragment_flag(&pkt);
-							if (nf == 0 && (rt_seq_num == 1 - last_rt_seq_num)) {
-								int s = thread_safe_data_packet_queue_try_push(&recv_queue, &pkt);
-								if (s == 0) {
-									last_rt_seq_num = rt_seq_num;
-								}
-							}
+					uint8_t nf = data_packet_get_null_fragment_flag(&pkt);
+					if (nf == 0 && (rt_seq_num == 1 - last_rt_seq_num)) {
+						int s = thread_safe_data_packet_queue_try_push(&recv_queue, &pkt);
+						if (s == 0) {
+							last_rt_seq_num = rt_seq_num;
 						}
 					}
 				}
 			}
-		} 
+		}
 	}
+
+	pthread_mutex_unlock(&connection_state_mutex);
 }

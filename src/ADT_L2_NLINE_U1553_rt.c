@@ -19,7 +19,7 @@ static atomic_bool running = false;
 static pthread_t polling_thread_id;
 
 static void *interrupt_poll(void *arg);
-static void ADT_L0_CALL_CONV myIntHandler(void *pUserData);
+static void myIntHandler();
 
 int rt1_init()
 {
@@ -161,13 +161,13 @@ int rt1_recv(void *buf, size_t size)
 static void *interrupt_poll(void *arg)
 {
 	while (atomic_load(&running)) {
-		myIntHandler(NULL);
+		myIntHandler();
 		ADT_L1_msSleep(1);
 	}
 	return NULL;
 }
 
-static void ADT_L0_CALL_CONV myIntHandler(void *pUserData)
+static void myIntHandler()
 {
 	ADT_L0_UINT32 intType[MAX_IQ_ENTRIES], intInfo[MAX_IQ_ENTRIES];
 	ADT_L0_UINT32 numInts = 0;

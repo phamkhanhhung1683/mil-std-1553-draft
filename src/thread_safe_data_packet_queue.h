@@ -26,6 +26,7 @@ struct data_packet {
 	 * [13:0] Fragment Offset (14 bits)
 	 */
 	uint16_t frag_info;
+
     uint8_t msg_id;
     uint8_t data_length;
 
