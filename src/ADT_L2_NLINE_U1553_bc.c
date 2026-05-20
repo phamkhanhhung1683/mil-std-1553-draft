@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include <pthread.h>
 
@@ -19,7 +20,7 @@ static atomic_bool running = false;
 static pthread_t polling_thread_id;
 
 static void *interrupt_poll(void *arg);
-static void ADT_L0_CALL_CONV myIntHandler(void *pUserData);
+static void myIntHandler();
 
 int bc_init()
 {
@@ -157,9 +158,10 @@ int bc_init()
 	thread_safe_data_packet_queue_init(&recv_queue);
 
 	atomic_store(&running, true);
+
 	int s = pthread_create(&polling_thread_id, NULL, &interrupt_poll, NULL);
 	if (s != 0) {
-		printf("pthread_create failed");;
+		printf("pthread_create failed\n");
 		return -1;
 	}
 
@@ -201,63 +203,64 @@ void bc_close()
 int bc_send(const void *buf, size_t size)
 {
 	static uint8_t msg_id = 0;
-	int ret = thread_safe_data_packet_queue_send_buf(&send_queue, buf, size, msg_id);
+	int ret = thread_safe_data_packet_queue_push_buf(&send_queue, buf, size, msg_id);
 	msg_id++;
 	return ret;
 }
 
 int bc_recv(void *buf, size_t size)
 {
-	return thread_safe_data_packet_queue_recv_buf(&recv_queue, buf, size);
+	return thread_safe_data_packet_queue_pop_buf(&recv_queue, buf, size);
 }
 
 static void *interrupt_poll(void *arg)
 {
 	while (atomic_load(&running)) {
-		myIntHandler(NULL);
+		myIntHandler();
 		ADT_L1_msSleep(1);
 	}
 	return NULL;
 }
 
-static void ADT_L0_CALL_CONV myIntHandler(void *pUserData)
+static void myIntHandler()
 {
 	ADT_L0_UINT32 intType[MAX_IQ_ENTRIES], intInfo[MAX_IQ_ENTRIES];
 	ADT_L0_UINT32 numInts = 0;
 	ADT_L0_UINT32 status = ADT_L1_1553_INT_IQ_ReadNewEntries(DEVID, MAX_IQ_ENTRIES, &numInts, intType, intInfo);
-	if ((status == ADT_SUCCESS) && numInts) {
-		for (int i = 0; i < numInts; i++) {
-			if ((intType[i] & 0xFFFF0000) == ADT_L1_1553_IQP_TYPESEQ_BCCB)
-			{
-				ADT_L0_UINT32 bccbNum = intInfo[i];
-				ADT_L1_1553_CDP myIntCdp = {0};
-				struct data_packet pkt = {0};
+	if ((status != ADT_SUCCESS) || (numInts == 0))
+		return;
+	
+	for (int i = 0; i < numInts; i++) {
+		if ((intType[i] & 0xFFFF0000) == ADT_L1_1553_IQP_TYPESEQ_BCCB)
+		{
+			ADT_L0_UINT32 bccbNum = intInfo[i];
+			ADT_L1_1553_CDP myIntCdp = {0};
+			struct data_packet pkt = {0};
 
-				if (bccbNum == 1) {
-					int s = thread_safe_data_packet_queue_try_pop(&send_queue, &pkt);
-					if (s == -1)
-						data_packet_set_nf(&pkt, 1);
+			if (bccbNum == 1) {  // BC sent data packet to RT
+				int s = thread_safe_data_packet_queue_try_pop(&send_queue, &pkt);
+				if (s == -1)
+					data_packet_set_null_fragment_flag(&pkt, 1);
 
+				uint16_t *data_word = (uint16_t *)&pkt;
+				for (int j = 0; j < 32; j++) {
+					myIntCdp.DATAinfo[j] = data_word[j];
+				}
+
+				ADT_L1_1553_BC_CB_CDPWrite(DEVID, 1, 0, &myIntCdp);
+			} else if (bccbNum == 2) {  // BC received data packet from RT
+				status = ADT_L1_1553_BC_CB_CDPRead(DEVID, 2, 0, &myIntCdp);
+				if ((status == ADT_SUCCESS)) {
 					uint16_t *data_word = (uint16_t *)&pkt;
 					for (int j = 0; j < 32; j++) {
-						myIntCdp.DATAinfo[j] = data_word[j];
+						data_word[j] = myIntCdp.DATAinfo[j];
 					}
 
-					ADT_L1_1553_BC_CB_CDPWrite(DEVID, 1, 0, &myIntCdp);
-				} else if (bccbNum == 2) {
-					status = ADT_L1_1553_BC_CB_CDPRead(DEVID, 2, 0, &myIntCdp);
-					if ((status == ADT_SUCCESS)) {
-						uint16_t *data_word = (uint16_t *)&pkt;
-						for (int j = 0; j < 32; j++) {
-							data_word[j] = myIntCdp.DATAinfo[j];
-						}
-
-						uint8_t nf = data_packet_get_nf(&pkt);
-						if (nf == 0)
-							thread_safe_data_packet_queue_try_push(&recv_queue, &pkt);
-					}
+					uint8_t nf = data_packet_get_null_fragment_flag(&pkt);
+					if (nf == 0)
+						thread_safe_data_packet_queue_try_push(&recv_queue, &pkt);
 				}
 			}
-		} 
+		}
 	}
 }

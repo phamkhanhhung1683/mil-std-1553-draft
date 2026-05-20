@@ -6,7 +6,7 @@
 
 #include <pthread.h>
 
-void thread_safe_data_packet_queue_init(struct thread_safe_data_packet_queue* q)
+void thread_safe_data_packet_queue_init(struct thread_safe_data_packet_queue *q)
 {
     q->head = 0;
     q->tail = 0;
@@ -16,14 +16,14 @@ void thread_safe_data_packet_queue_init(struct thread_safe_data_packet_queue* q)
     pthread_cond_init(&q->not_full, NULL);
 }
 
-void thread_safe_data_packet_queue_destroy(struct thread_safe_data_packet_queue* q)
+void thread_safe_data_packet_queue_destroy(struct thread_safe_data_packet_queue *q)
 {
     pthread_mutex_destroy(&q->mutex);
     pthread_cond_destroy(&q->not_empty);
     pthread_cond_destroy(&q->not_full);
 }
 
-void thread_safe_data_packet_queue_push(struct thread_safe_data_packet_queue* q, const struct data_packet* pkt)
+void thread_safe_data_packet_queue_push(struct thread_safe_data_packet_queue *q, const struct data_packet* pkt)
 {
     pthread_mutex_lock(&q->mutex);
 
@@ -40,7 +40,7 @@ void thread_safe_data_packet_queue_push(struct thread_safe_data_packet_queue* q,
     pthread_mutex_unlock(&q->mutex);
 }
 
-int thread_safe_data_packet_queue_try_push(struct thread_safe_data_packet_queue* q, const struct data_packet* pkt)
+int thread_safe_data_packet_queue_try_push(struct thread_safe_data_packet_queue *q, const struct data_packet* pkt)
 {
     int ret = -1;
 
@@ -60,7 +60,7 @@ int thread_safe_data_packet_queue_try_push(struct thread_safe_data_packet_queue*
     return ret;
 }
 
-void thread_safe_data_packet_queue_pop(struct thread_safe_data_packet_queue* q, struct data_packet* pkt)
+void thread_safe_data_packet_queue_pop(struct thread_safe_data_packet_queue *q, struct data_packet* pkt)
 {
     pthread_mutex_lock(&q->mutex);
 
@@ -77,7 +77,7 @@ void thread_safe_data_packet_queue_pop(struct thread_safe_data_packet_queue* q, 
     pthread_mutex_unlock(&q->mutex);
 }
 
-int thread_safe_data_packet_queue_try_pop(struct thread_safe_data_packet_queue* q, struct data_packet* pkt)
+int thread_safe_data_packet_queue_try_pop(struct thread_safe_data_packet_queue *q, struct data_packet* pkt)
 {
     int ret = -1;
 
@@ -97,9 +97,9 @@ int thread_safe_data_packet_queue_try_pop(struct thread_safe_data_packet_queue* 
     return ret;
 }
 
-int thread_safe_data_packet_queue_send_buf(struct thread_safe_data_packet_queue* q, const void *buf, size_t size, uint8_t msg_id)
+int thread_safe_data_packet_queue_push_buf(struct thread_safe_data_packet_queue *q, const void *buf, size_t size, uint8_t msg_id)
 {
-    if (size == 0 || size > 65532)
+    if (buf == NULL || size == 0 || size > 65532)
 		return -1;
 
 	uint16_t byte_pos = 0;
@@ -107,13 +107,13 @@ int thread_safe_data_packet_queue_send_buf(struct thread_safe_data_packet_queue*
         struct data_packet fragment = {0};
 
         uint16_t remaining = (uint16_t)size - byte_pos;
-        uint16_t current_payload = (remaining > DATA_MAX_LENGTH) ? DATA_MAX_LENGTH : remaining;
+        uint16_t current_payload = (remaining > MAX_DATA_LENGTH) ? MAX_DATA_LENGTH : remaining;
 
         fragment.id = msg_id;
         fragment.data_length = (uint8_t)current_payload;
-		data_packet_set_nf(&fragment, 0);
-		data_packet_set_mf(&fragment, remaining > DATA_MAX_LENGTH);
-		data_packet_set_offset(&fragment, byte_pos / 4);
+		data_packet_set_null_fragment_flag(&fragment, 0);
+		data_packet_set_more_fragments_flag(&fragment, remaining > MAX_DATA_LENGTH);
+		data_packet_set_fragment_offset(&fragment, byte_pos / 4);
 
         memcpy(fragment.data, (char*)buf + byte_pos, current_payload);
 
@@ -124,9 +124,9 @@ int thread_safe_data_packet_queue_send_buf(struct thread_safe_data_packet_queue*
     return (int)byte_pos;
 }
 
-int thread_safe_data_packet_queue_recv_buf(struct thread_safe_data_packet_queue* q, void *buf, size_t size)
+int thread_safe_data_packet_queue_pop_buf(struct thread_safe_data_packet_queue *q, void *buf, size_t size)
 {
-    if (size == 0 || size > 65532)
+    if (buf == NULL || size == 0 || size > 65532)
         return -1;
 
     struct data_packet pkt;
@@ -136,44 +136,33 @@ int thread_safe_data_packet_queue_recv_buf(struct thread_safe_data_packet_queue*
     uint8_t *output = (uint8_t *)buf;
 
     while (1) {
-        // Pop blocking
         thread_safe_data_packet_queue_pop(q, &pkt);
 
-        uint16_t pkt_offset_units = data_packet_get_offset(&pkt);
-        uint8_t mf = data_packet_get_mf(&pkt);
+        uint16_t pkt_offset_units = data_packet_get_fragment_offset(&pkt);
+        uint8_t mf = data_packet_get_more_fragments_flag(&pkt);
 
-        // --- Kiểm tra điều kiện bắt đầu bản tin mới ---
+        // Check starting new buffer
         if (!is_assembling || pkt.id != current_msg_id) {
             if (pkt_offset_units == 0) {
                 is_assembling = true;
                 current_msg_id = pkt.id;
                 expected_offset_units = 0;
             } else {
-                // Bỏ qua các mảnh "mồ côi" không phải offset 0
                 is_assembling = false;
                 continue;
             }
         }
 
-        // --- Kiểm tra tính toàn vẹn của Offset ---
-        
-        // Mảnh bị trùng (Duplicate) -> Bỏ qua
-        if (pkt_offset_units < expected_offset_units) {
+        if (pkt_offset_units < expected_offset_units) {  // Duplicate packet
             continue;
-        }
-
-        // Mảnh bị nhảy cóc (Missed packet) -> Hủy bản tin hiện tại
-        if (pkt_offset_units > expected_offset_units) {
+        } else if (pkt_offset_units > expected_offset_units) {  // Missed packet
             is_assembling = false;
             continue;
         }
 
-        // --- Chép dữ liệu với cơ chế Truncation ---
         uint32_t offset_bytes = pkt_offset_units * 4;
-
         if (offset_bytes < size) {
             size_t space_left = size - offset_bytes;
-            // Sử dụng pkt.data_length thay vì DATA_MAX_LENGTH để lấy đúng số byte gửi
             size_t copy_len = (pkt.data_length > space_left) ? space_left : pkt.data_length;
             
             if (copy_len > 0) {
@@ -181,15 +170,11 @@ int thread_safe_data_packet_queue_recv_buf(struct thread_safe_data_packet_queue*
             }
         }
 
-        // Cập nhật offset kỳ vọng: luôn cộng 15 (60/4) vì các mảnh giữa luôn phải full
         expected_offset_units += (pkt.data_length / 4);
 
-        // --- Kết thúc bản tin ---
         if (mf == 0) {
-            is_assembling = false;
-            // Kích thước thực tế = vị trí bắt đầu mảnh cuối + độ dài mảnh cuối
+            // is_assembling = false;
             uint32_t total_actual_size = offset_bytes + pkt.data_length;
-            
             return (total_actual_size > size) ? (int)size : (int)total_actual_size;
         }
     }

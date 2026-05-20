@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include <pthread.h>
 
@@ -19,7 +20,7 @@ static atomic_bool running = false;
 static pthread_t polling_thread_id;
 
 static void *interrupt_poll(void *arg);
-static void ADT_L0_CALL_CONV myIntHandler(void *pUserData);
+static void myIntHandler();
 
 int rt1_init()
 {
@@ -148,26 +149,26 @@ void rt1_close()
 int rt1_send(const void *buf, size_t size)
 {
 	static uint8_t msg_id = 0;
-	int ret = thread_safe_data_packet_queue_send_buf(&send_queue, buf, size, msg_id);
+	int ret = thread_safe_data_packet_queue_push_buf(&send_queue, buf, size, msg_id);
 	msg_id++;
 	return ret;
 }
 
 int rt1_recv(void *buf, size_t size)
 {
-	return thread_safe_data_packet_queue_recv_buf(&recv_queue, buf, size);
+	return thread_safe_data_packet_queue_pop_buf(&recv_queue, buf, size);
 }
 
 static void *interrupt_poll(void *arg)
 {
 	while (atomic_load(&running)) {
-		myIntHandler(NULL);
+		myIntHandler();
 		ADT_L1_msSleep(1);
 	}
 	return NULL;
 }
 
-static void ADT_L0_CALL_CONV myIntHandler(void *pUserData)
+static void myIntHandler()
 {
 	ADT_L0_UINT32 intType[MAX_IQ_ENTRIES], intInfo[MAX_IQ_ENTRIES];
 	ADT_L0_UINT32 numInts = 0;
@@ -188,14 +189,14 @@ static void ADT_L0_CALL_CONV myIntHandler(void *pUserData)
 							data_word[j] = myIntCdp.DATAinfo[j];
 						}
 
-						uint8_t nf = data_packet_get_nf(&pkt);
+						uint8_t nf = data_packet_get_null_fragment_flag(&pkt);
 						if (nf == 0)
 							thread_safe_data_packet_queue_try_push(&recv_queue, &pkt);
 					}
 				} else if (tr == 1) {  /* 1st CDP of RT1 TRANSMIT SA1 */
 					int s = thread_safe_data_packet_queue_try_pop(&send_queue, &pkt);
 					if (s == -1)
-						data_packet_set_nf(&pkt, 1);
+						data_packet_set_null_fragment_flag(&pkt, 1);
 
 					uint16_t *data_word = (uint16_t *)&pkt;
 					for (int j = 0; j < 32; j++) {

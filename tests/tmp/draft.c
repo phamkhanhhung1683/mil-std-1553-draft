@@ -1,8 +1,8 @@
 #include <stdio.h>
 #include <stdint.h>
 
-#include "thread_safe_buf_queue.h"
-#include "thread_safe_buf_queue.c"
+// #include "thread_safe_buf_queue.h"
+// #include "thread_safe_buf_queue.c"
 
 #define BLOCK_SIZE 64
 #define PAYLOAD_SIZE 60
