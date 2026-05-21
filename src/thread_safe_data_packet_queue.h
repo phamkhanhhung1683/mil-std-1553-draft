@@ -1,6 +1,7 @@
 #ifndef _THREAD_SAFE_DATA_PACKET_QUEUE_H
 #define _THREAD_SAFE_DATA_PACKET_QUEUE_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include <pthread.h>

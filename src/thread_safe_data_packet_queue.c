@@ -1,6 +1,7 @@
 #include "thread_safe_data_packet_queue.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -153,7 +154,7 @@ int thread_safe_data_packet_queue_pop_buf(struct thread_safe_data_packet_queue *
             }
         }
 
-        if (pkt_offset_units < expected_offset_units) {  // Duplicate packet
+        if (pkt_offset_units < expected_offset_units) {  // Duplicated packet
             continue;
         } else if (pkt_offset_units > expected_offset_units) {  // Missed packet
             is_assembling = false;

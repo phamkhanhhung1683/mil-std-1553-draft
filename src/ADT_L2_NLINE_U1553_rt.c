@@ -1,5 +1,6 @@
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -146,7 +147,7 @@ void rt1_close()
 		printf("FAILURE - Error = %d %s\n", status, ADT_L1_Error_to_String(status));
 }
 
-int rt1_send(const void *buf, size_t size)
+int l2_rt1_send(const void *buf, size_t size)
 {
 	static uint8_t msg_id = 0;
 	int ret = thread_safe_data_packet_queue_push_buf(&send_queue, buf, size, msg_id);
@@ -154,7 +155,7 @@ int rt1_send(const void *buf, size_t size)
 	return ret;
 }
 
-int rt1_recv(void *buf, size_t size)
+int l2_rt1_recv(void *buf, size_t size)
 {
 	return thread_safe_data_packet_queue_pop_buf(&recv_queue, buf, size);
 }
